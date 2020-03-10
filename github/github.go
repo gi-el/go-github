@@ -153,8 +153,10 @@ type Client struct {
 	// User agent used when communicating with the GitHub API.
 	UserAgent string
 
+	rateCheck  bool // enable pre-emptive rate limit checking
 	rateMu     sync.Mutex
 	rateLimits [categories]Rate // Rate limits for the client as determined by the most recent API calls.
+	retries    int              // Number of times we retry the request on error
 
 	common service // Reuse a single struct instead of allocating one for each service on the heap.
 
@@ -263,7 +265,7 @@ func NewClient(httpClient *http.Client) *Client {
 	baseURL, _ := url.Parse(defaultBaseURL)
 	uploadURL, _ := url.Parse(uploadBaseURL)
 
-	c := &Client{client: httpClient, BaseURL: baseURL, UserAgent: userAgent, UploadURL: uploadURL}
+	c := &Client{client: httpClient, BaseURL: baseURL, UserAgent: userAgent, rateCheck: true, retries: 1, UploadURL: uploadURL}
 	c.common.client = c
 	c.Actions = (*ActionsService)(&c.common)
 	c.Activity = (*ActivityService)(&c.common)
@@ -328,6 +330,16 @@ func NewEnterpriseClient(baseURL, uploadURL string, httpClient *http.Client) (*C
 	c.BaseURL = baseEndpoint
 	c.UploadURL = uploadEndpoint
 	return c, nil
+}
+
+func (c *Client) WithRateCheck(check bool) *Client {
+	c.rateCheck = check
+	return c
+}
+
+func (c *Client) WithRetries(retries int) *Client {
+	c.retries = retries
+	return c
 }
 
 // NewRequest creates an API request. A relative URL can be provided in urlStr,
@@ -523,13 +535,53 @@ func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*Res
 	rateLimitCategory := category(req.URL.Path)
 
 	// If we've hit rate limit, don't make further requests before Reset time.
-	if err := c.checkRateLimitBeforeDo(req, rateLimitCategory); err != nil {
-		return &Response{
-			Response: err.Response,
-			Rate:     err.Rate,
-		}, err
+	if c.rateCheck {
+		if err := c.checkRateLimitBeforeDo(req, rateLimitCategory); err != nil {
+			return &Response{
+				Response: err.Response,
+				Rate:     err.Rate,
+			}, err
+		}
 	}
 
+	var resp *Response
+	var err error
+	for retries := c.retries; retries > 0 && ctx.Err() == nil; retries-- {
+		resp, err = c.do(ctx, req, rateLimitCategory)
+		// StatusForbidden is what Github returns when rate limiting.
+		// If resp == nil, retrying won't help as it's an error on our side
+		if err == nil || resp == nil || (resp != nil && resp.StatusCode <= 500 && resp.StatusCode != http.StatusForbidden) {
+			break
+		}
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+	}
+
+	if err != nil {
+		return resp, err
+	}
+	defer resp.Body.Close()
+
+	if v != nil {
+		if w, ok := v.(io.Writer); ok {
+			io.Copy(w, resp.Body)
+		} else {
+			decErr := json.NewDecoder(resp.Body).Decode(v)
+			if decErr == io.EOF {
+				decErr = nil // ignore EOF errors caused by empty response body
+			}
+			if decErr != nil {
+				err = decErr
+			}
+		}
+	}
+
+	return resp, err
+}
+
+// Do inner loop - potentially repeated on error
+func (c *Client) do(ctx context.Context, req *http.Request, rateLimitCategory rateLimitCategory) (*Response, error) {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		// If we got an error, and the context has been canceled,
@@ -550,7 +602,6 @@ func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*Res
 
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	response := newResponse(resp)
 
@@ -579,21 +630,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*Res
 		return response, err
 	}
 
-	if v != nil {
-		if w, ok := v.(io.Writer); ok {
-			io.Copy(w, resp.Body)
-		} else {
-			decErr := json.NewDecoder(resp.Body).Decode(v)
-			if decErr == io.EOF {
-				decErr = nil // ignore EOF errors caused by empty response body
-			}
-			if decErr != nil {
-				err = decErr
-			}
-		}
-	}
-
-	return response, err
+	return response, nil
 }
 
 // checkRateLimitBeforeDo does not make any network calls, but uses existing knowledge from
